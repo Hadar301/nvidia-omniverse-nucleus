@@ -1,224 +1,141 @@
-# NVIDIA Omniverse Nucleus - Docker-in-Docker Deployment on OpenShift
+# NVIDIA Omniverse Nucleus - DIND Deployment Guide
 
-This deployment runs NVIDIA Omniverse Nucleus using Docker-in-Docker (DIND) on Red Hat OpenShift, preserving the official Docker Compose architecture while adapting it for Kubernetes.
+Complete guide for deploying NVIDIA Omniverse Nucleus using Docker-in-Docker (DIND) on Red Hat OpenShift.
 
 ## Overview
 
-NVIDIA Omniverse Nucleus is officially designed for Docker Compose on Ubuntu 22.04 LTS. This deployment strategy:
-
-1. **Runs Docker-in-Docker**: Uses a privileged pod containing a Docker daemon
-2. **Preserves Docker Compose**: Runs the official `nucleus-stack-no-ssl.yml` unchanged inside the pod
-3. **Automatic LoadBalancer Configuration**: Detects AWS ELB hostname and configures services automatically
-4. **NGINX Proxy**: Configures Navigator to proxy external API requests to internal Docker services
+This deployment runs NVIDIA's official Docker Compose stack inside an OpenShift pod using Docker-in-Docker. It automatically configures the LoadBalancer hostname and NGINX proxy for external access.
 
 ### Architecture
 
 ```
-External Client (Browser)
+External Browser
     ↓
-AWS LoadBalancer (ada857f8214ef4e1e856b39a164459a2-752788023.us-east-1.elb.amazonaws.com)
+AWS LoadBalancer (ELB)
     ↓
 OpenShift Pod (nucleus-dind)
     ├── Docker Daemon (DIND container)
     └── Docker Compose (12 services in Docker network)
+        ├── nucleus-navigator:80 (NGINX proxy)
         ├── nucleus-discovery:3333
         ├── nucleus-auth:3100
         ├── nucleus-api:3009
-        ├── nucleus-navigator:80 (NGINX proxy)
         └── ... 8 more services
 ```
 
 ## Prerequisites
 
-1. **OpenShift Cluster**:
-   - At least 16 cores and 32GB RAM available
-   - Block storage (AWS EBS gp3-csi recommended) - 500Gi minimum
-   - Cluster admin access for privileged containers
+### 1. OpenShift Cluster
 
-2. **NGC Package**:
-   - Download `nucleus-stack-2023.2.x+tag-xxx.tar.gz` from [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/omniverse/resources/nucleus-compose-stack-pb24h2)
-   - Place in repository root directory
+- **Resources**: 16+ cores, 32GB RAM minimum (32+ cores, 64GB for production)
+- **Storage**: 500GB block storage (AWS EBS gp3-csi recommended)
+- **LoadBalancer**: AWS ELB support
+- **Permissions**: Cluster admin access for privileged containers
 
-3. **NGC API Key**:
-   - Already configured in `.env` file
-   - Used for pulling container images from `nvcr.io`
+### 2. NGC Package
 
-## Quick Start
+**Already included** in `upstream/nucleus-stack-2023.2.9+tag-xxx.tar.gz`
 
-### 1. Deploy Nucleus
+To download a newer version:
+
+1. Visit [NGC Catalog - Nucleus Stack](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/omniverse/resources/nucleus-compose-stack/files?version=2023.2.9)
+2. Sign in with your NVIDIA account (free)
+3. Navigate to **Files** tab
+4. Select the latest version from dropdown
+5. Click **Download** next to `nucleus-stack-2023.2.x+tag-xxx.tar.gz`
+6. Save to `upstream/` directory
+
+```bash
+mv ~/Downloads/nucleus-stack-*.tar.gz upstream/
+```
+
+### 3. NGC API Key
+
+Get your API key:
+1. Go to [NGC Account Settings](https://ngc.nvidia.com/setup)
+2. Click **Generate API Key**
+3. Copy and save to `.env` file:
+
+```bash
+cat > .env <<EOF
+NGC_API_KEY=your_ngc_api_key_here
+NAMESPACE=omniverse-nucleus
+EOF
+```
+
+## Deploy
 
 ```bash
 ./deploy-dind/deploy-dind.sh
 ```
 
-This will:
-- Create ServiceAccount with privileged SCC and RBAC permissions
-- Extract NGC package and create ConfigMap with docker-compose files and crypto secrets
-- Create 500Gi PVC for persistent data storage
-- Deploy DIND pod with init container that waits for LoadBalancer
-- Configure SERVER_IP_OR_HOST automatically
-- Start all 12 Docker Compose services
-- Configure NGINX proxy in Navigator
+The script automatically:
+- Creates ServiceAccount with privileged SCC
+- Generates crypto secrets if they don't exist
+- Extracts NGC package and creates ConfigMap
+- Creates 500Gi PVC for persistent data
+- Deploys DIND pod with init container that waits for LoadBalancer
+- Configures `SERVER_IP_OR_HOST` automatically
+- Starts all 12 Docker Compose services
+- Configures NGINX proxy in Navigator
 
-**Expected output:**
-```
-======================================
-✅ DIND deployment initiated!
-======================================
+**Wait time**: 5-10 minutes for Docker Compose to start all services
 
-Monitor startup with:
-  oc logs -f deployment/nucleus-dind -c nucleus-compose -n hacohen-omniverse
-
-Get LoadBalancer URL:
-  oc get svc nucleus-dind -n hacohen-omniverse -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-```
-
-### 2. Monitor Startup
-
-Docker Compose startup takes **5-10 minutes**. Monitor progress:
+## Monitor Startup
 
 ```bash
 # Watch logs
-oc logs -f deployment/nucleus-dind -c nucleus-compose -n hacohen-omniverse
+oc logs -f deployment/nucleus-dind -c nucleus-compose -n omniverse-nucleus
 
 # Check pod status
-oc get pods -n hacohen-omniverse -l app=nucleus-dind
+oc get pods -n omniverse-nucleus -l app=nucleus-dind
 
-# Check all containers are healthy
-oc exec deployment/nucleus-dind -c dind -n hacohen-omniverse -- docker ps
+# Check Docker containers are healthy
+oc exec deployment/nucleus-dind -c dind -n omniverse-nucleus -- docker ps
 ```
 
-### 3. Get LoadBalancer URL
+## Access Navigator
 
 ```bash
-oc get svc nucleus-dind -n hacohen-omniverse -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+# Get LoadBalancer URL
+oc get svc nucleus-dind -n omniverse-nucleus -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
 ```
 
-Example output: `a6baec0c9131b4b94a6f75d18c383d9a-752788023.us-east-1.elb.amazonaws.com`
+Open browser to: `http://<loadbalancer-hostname>`
 
-### 4. Access Navigator
+**Login**:
+- Username: `omniverse`
+- Password: `omniverse123`
 
-1. Open browser to: `http://<LoadBalancer-hostname>`
-2. Login with:
-   - **Username**: `omniverse`
-   - **Password**: `omniverse123`
-
-## Key Technical Details
+## How It Works
 
 ### Networking Challenge
 
-**Problem**: Docker Compose services need to:
-- Communicate with each other using internal Docker network names (`nucleus-auth:3100`)
-- Register with discovery service using a publicly accessible hostname
-- Accept connections from external browsers through LoadBalancer
+Docker Compose services need to:
+- Communicate internally using Docker network names (`nucleus-auth:3100`)
+- Register with discovery using a public hostname
+- Accept external browser connections through LoadBalancer
 
-**Solution**:
-1. **Init Container** (`wait-for-loadbalancer`):
-   - Waits for LoadBalancer to provision (up to 5 minutes)
-   - Queries LoadBalancer hostname using `oc` CLI with ServiceAccount RBAC permissions
-   - Writes hostname to shared emptyDir volume: `/shared/loadbalancer-hostname`
+### Solution: Init Container + NGINX Proxy
 
-2. **Main Container** (`nucleus-compose`):
-   - Reads LoadBalancer hostname from shared volume
-   - Updates `.env` file: `sed -i "/^SERVER_IP_OR_HOST=/c\SERVER_IP_OR_HOST=$LB_HOST" .env`
-   - Starts Docker Compose with correct configuration
-   - Configures NGINX in Navigator to proxy `/omni/*` requests to internal services
+**1. Init Container** (`wait-for-loadbalancer`):
+- Waits up to 5 minutes for LoadBalancer to provision
+- Queries hostname using `oc` CLI with ServiceAccount RBAC permissions
+- Writes hostname to shared volume: `/shared/loadbalancer-hostname`
 
-3. **Service Registration**:
-   - Services register with discovery using LoadBalancer hostname
-   - Example: `{"host": "a6baec0c9131b4b94a6f75d18c383d9a-752788023.us-east-1.elb.amazonaws.com", "port": 3100}`
+**2. Main Container** (`nucleus-compose`):
+- Reads LoadBalancer hostname from shared volume
+- Updates `.env` file: `sed -i "/^SERVER_IP_OR_HOST=/c\SERVER_IP_OR_HOST=$LB_HOST" .env`
+- Starts Docker Compose with correct configuration
+- Configures NGINX in Navigator to proxy `/omni/*` requests to internal services
 
-### File Structure
-
-```
-nucleus-server/
-├── deploy-dind/
-│   ├── nucleus-dind-simple.yaml    # Main deployment with DIND + init container
-│   └── privileged-sa.yaml          # ServiceAccount with RBAC for service queries
-├── scripts/
-│   ├── deploy-dind.sh              # Deployment script
-│   └── validate-deployment.sh      # Validation tests
-└── nucleus-stack-*.tar.gz          # NGC package (downloaded separately)
-```
-
-### Key Configuration Files
-
-#### 1. Init Container (nucleus-dind-simple.yaml:36-57)
-
-```yaml
-initContainers:
-- name: wait-for-loadbalancer
-  image: registry.redhat.io/openshift4/ose-cli:latest
-  command: ["/bin/bash", "-c"]
-  args:
-    - |
-      echo "Waiting for LoadBalancer hostname..."
-      for i in $(seq 1 60); do
-        LB_HOST=$(oc get service nucleus-dind -n hacohen-omniverse -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-        if [ -n "$LB_HOST" ]; then
-          echo "LoadBalancer ready: $LB_HOST"
-          echo "$LB_HOST" > /shared/loadbalancer-hostname
-          exit 0
-        fi
-        echo "Waiting... ($i/60)"
-        sleep 5
-      done
-  volumeMounts:
-    - name: shared-data
-      mountPath: /shared
-```
-
-#### 2. SERVER_IP_OR_HOST Configuration (nucleus-dind-simple.yaml:111-120)
-
-```bash
-# Set SERVER_IP_OR_HOST from LoadBalancer hostname (written by init container)
-if [ -f /shared/loadbalancer-hostname ]; then
-  LB_HOST=$(cat /shared/loadbalancer-hostname)
-  echo "Setting SERVER_IP_OR_HOST to LoadBalancer: $LB_HOST"
-  sed -i "/^SERVER_IP_OR_HOST=/c\SERVER_IP_OR_HOST=$LB_HOST" .env
-  echo "✓ SERVER_IP_OR_HOST configured"
-else
-  echo "WARNING: LoadBalancer hostname file not found"
-fi
-```
-
-#### 3. NGINX Proxy Configuration (nucleus-dind-simple.yaml:131-182)
-
-```nginx
-server {
-    listen 80;
-    server_name _;
-
-    # Proxy /omni/discovery/ → nucleus-discovery:3333
-    location /omni/discovery/ {
-        proxy_pass http://nucleus-discovery:3333/;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-    }
-
-    # Proxy /omni/auth/ → nucleus-auth:3100
-    location /omni/auth/ {
-        proxy_pass http://nucleus-auth:3100/;
-    }
-
-    # Proxy /omni/ → nucleus-api:3009
-    location /omni/ {
-        proxy_pass http://nucleus-api:3009/;
-        proxy_read_timeout 86400;
-    }
-
-    # Static files for Navigator UI
-    location / {
-        root /usr/share/nginx/html;
-        try_files $uri /index.html;
-    }
-}
+**3. Service Registration**:
+Services register with discovery using LoadBalancer hostname:
+```json
+{"host": "a6baec0c9131b4b94a6f75d18c383d9a-752788023.us-east-1.elb.amazonaws.com", "port": 3100}
 ```
 
 ## Services Exposed
-
-The LoadBalancer Service exposes these ports:
 
 | Service | Port | Protocol | Purpose |
 |---------|------|----------|---------|
@@ -235,7 +152,7 @@ The LoadBalancer Service exposes these ports:
 
 ## Persistent Storage
 
-- **PVC**: `nucleus-dind-data` (500Gi, gp3-csi)
+- **PVC**: `nucleus-dind-data` (500Gi)
 - **Mount**: `/var/lib/omni/nucleus-data` inside Docker containers
 - **Contains**:
   - Core database: `/var/lib/omni/nucleus-data/data`
@@ -249,114 +166,76 @@ The LoadBalancer Service exposes these ports:
 
 Check init container logs:
 ```bash
-oc logs deployment/nucleus-dind -c wait-for-loadbalancer -n hacohen-omniverse
+oc logs deployment/nucleus-dind -c wait-for-loadbalancer -n omniverse-nucleus
 ```
 
-If LoadBalancer isn't provisioning, check Service:
+If LoadBalancer isn't provisioning:
 ```bash
-oc get svc nucleus-dind -n hacohen-omniverse -o yaml
+oc get svc nucleus-dind -n omniverse-nucleus -o yaml
 ```
 
 ### Services Not Starting
 
 Check Docker daemon:
 ```bash
-oc exec deployment/nucleus-dind -c dind -n hacohen-omniverse -- docker ps
+oc exec deployment/nucleus-dind -c dind -n omniverse-nucleus -- docker ps
 ```
 
 Check docker-compose logs:
 ```bash
-oc logs -f deployment/nucleus-dind -c nucleus-compose -n hacohen-omniverse
+oc logs -f deployment/nucleus-dind -c nucleus-compose -n omniverse-nucleus
 ```
 
 ### Navigator Shows "Disconnected"
 
-1. Check NGINX configuration inside Navigator container:
+1. Check NGINX configuration:
 ```bash
-oc exec deployment/nucleus-dind -c dind -n hacohen-omniverse -- \
+oc exec deployment/nucleus-dind -c dind -n omniverse-nucleus -- \
   docker exec base_stack-nucleus-navigator-1 cat /etc/nginx/sites-available/default
 ```
 
 2. Verify services registered with LoadBalancer hostname:
 ```bash
-oc exec deployment/nucleus-dind -c dind -n hacohen-omniverse -- \
+oc exec deployment/nucleus-dind -c dind -n omniverse-nucleus -- \
   docker logs base_stack-nucleus-discovery-1 | grep "host"
 ```
 
-Should show: `"host": "a6baec0c9131b4b94a6f75d18c383d9a-752788023.us-east-1.elb.amazonaws.com"`
+Should show LoadBalancer hostname, not internal service names.
 
 ### Permission Denied Errors
 
 Verify privileged SCC is bound:
 ```bash
-oc adm policy who-can use scc privileged -n hacohen-omniverse | grep nucleus-dind-sa
+oc adm policy who-can use scc privileged -n omniverse-nucleus | grep nucleus-dind-sa
 ```
 
 Should show: `nucleus-dind-sa`
 
 ## Cleanup
 
-### Delete Deployment (Keep Data)
-
 ```bash
-oc delete deployment nucleus-dind -n hacohen-omniverse
-oc delete service nucleus-dind -n hacohen-omniverse
-oc delete configmap nucleus-compose-files -n hacohen-omniverse
+./deploy-dind/cleanup-dind.sh
 ```
 
-### Full Cleanup (Delete Everything)
+Prompts for confirmation before deleting:
+- Deployment and Service
+- PVC (⚠️ data loss!)
+- ConfigMaps
+- ServiceAccount and RBAC
+- Secrets
 
-```bash
-oc delete deployment nucleus-dind -n hacohen-omniverse
-oc delete service nucleus-dind -n hacohen-omniverse
-oc delete pvc nucleus-dind-data -n hacohen-omniverse  # WARNING: Data loss!
-oc delete configmap nucleus-compose-files -n hacohen-omniverse
-oc delete secret crypto-secrets master-password service-password -n hacohen-omniverse
-```
+## Files
 
-## Redeployment
+- `deploy-dind.sh` - Main deployment script
+- `cleanup-dind.sh` - Cleanup script
+- `nucleus-dind-simple.yaml` - Pod and LoadBalancer definitions
+- `privileged-sa.yaml` - ServiceAccount with RBAC permissions
+- `generate-secrets.sh` - Crypto secret generation (auto-called)
 
-To redeploy after cleanup:
+## NVIDIA Documentation
 
-```bash
-./deploy-dind/deploy-dind.sh
-```
-
-All configuration is automated - no manual steps required!
-
-## Advantages of DIND Approach
-
-1. **Official Images**: Uses unmodified NVIDIA container images
-2. **Docker Compose Compatibility**: Runs official `nucleus-stack-no-ssl.yml` without changes
-3. **Simple Updates**: Download new NGC package and redeploy
-4. **Familiar Troubleshooting**: Standard Docker Compose commands work inside pod
-5. **Automatic Configuration**: LoadBalancer hostname detection and service configuration
-6. **Persistent Storage**: Data survives pod restarts
-
-## Limitations
-
-1. **Privileged Mode Required**: DIND needs privileged security context
-2. **Single Pod**: Cannot scale horizontally (Docker Compose limitation)
-3. **Resource Overhead**: Docker-in-Docker adds some overhead vs native Kubernetes
-4. **No SSL/TLS**: Current deployment uses non-SSL mode (can be upgraded)
-
-## Next Steps
-
-1. **Enable SSL/TLS**: Switch to `nucleus-stack-ssl.yml` with cert-manager
-2. **SSO Integration**: Configure enterprise authentication (LDAP, OAuth)
-3. **High Availability**: Implement automated backup/restore with Velero
-4. **Monitoring**: Integrate Prometheus metrics (available on API port 3010)
-5. **Production Secrets**: Replace sample crypto secrets with properly generated keys
-
-## References
-
-- [NVIDIA Omniverse Nucleus Documentation](https://docs.omniverse.nvidia.com/nucleus/latest/)
-- [NGC Catalog - Nucleus Stack](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/omniverse/resources/nucleus-compose-stack-pb24h2)
-- [OpenShift Documentation](https://docs.openshift.com/)
-
-## Support
-
-For issues or questions:
-1. Check logs: `oc logs -f deployment/nucleus-dind -c nucleus-compose -n hacohen-omniverse`
-2. Verify pod status: `oc get pods -n hacohen-omniverse -l app=nucleus-dind`
-3. Check Docker containers: `oc exec deployment/nucleus-dind -c dind -- docker ps`
+- [Nucleus Overview](https://docs.omniverse.nvidia.com/nucleus/)
+- [Architecture Guide](https://docs.omniverse.nvidia.com/nucleus/latest/architecture.html)
+- [Sizing Guide](https://docs.omniverse.nvidia.com/nucleus/latest/sizing-guide.html)
+- [Enterprise Installation](https://docs.omniverse.nvidia.com/nucleus/latest/enterprise/installation/install-ove-nucleus.html)
+- [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/omniverse/resources/nucleus-compose-stack-pb24h2)
