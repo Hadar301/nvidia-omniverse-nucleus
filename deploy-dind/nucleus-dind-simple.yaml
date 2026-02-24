@@ -1,0 +1,316 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nucleus-dind-data
+  namespace: hacohen-omniverse
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: gp3-csi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nucleus-dind
+  namespace: hacohen-omniverse
+  labels:
+    app: nucleus-dind
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nucleus-dind
+  template:
+    metadata:
+      labels:
+        app: nucleus-dind
+    spec:
+      serviceAccountName: nucleus-dind-sa
+      securityContext:
+        runAsUser: 0
+        fsGroup: 0
+      initContainers:
+      - name: wait-for-loadbalancer
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            echo "Waiting for LoadBalancer hostname..."
+            for i in $(seq 1 60); do
+              LB_HOST=$(oc get service nucleus-dind -n hacohen-omniverse -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+              if [ -n "$LB_HOST" ]; then
+                echo "LoadBalancer ready: $LB_HOST"
+                echo "$LB_HOST" > /shared/loadbalancer-hostname
+                exit 0
+              fi
+              echo "Waiting... ($i/60)"
+              sleep 5
+            done
+            echo "WARNING: LoadBalancer not ready after 5 minutes"
+            echo "hostname-or-ip-here" > /shared/loadbalancer-hostname
+        volumeMounts:
+          - name: shared-data
+            mountPath: /shared
+      containers:
+      - name: dind
+        image: docker:24-dind
+        securityContext:
+          privileged: true
+        env:
+          - name: DOCKER_TLS_CERTDIR
+            value: ""
+        volumeMounts:
+          - name: docker-storage
+            mountPath: /var/lib/docker
+          - name: nucleus-data
+            mountPath: /var/lib/omni/nucleus-data
+          - name: workspace
+            mountPath: /workspace
+        resources:
+          requests:
+            cpu: "8000m"
+            memory: "16Gi"
+          limits:
+            cpu: "16000m"
+            memory: "32Gi"
+      - name: nucleus-compose
+        image: docker:24-cli
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            echo "Waiting for Docker daemon..."
+            while ! docker ps >/dev/null 2>&1; do
+              sleep 2
+            done
+            echo "Docker daemon ready!"
+
+            echo "Installing dependencies..."
+            apk add --no-cache curl
+
+            echo "Installing docker-compose..."
+            curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+
+            echo "Logging into NGC registry..."
+            echo "${NGC_API_KEY}" | docker login nvcr.io --username '$oauthtoken' --password-stdin
+
+            echo "Setting up workspace..."
+            mkdir -p /workspace/base_stack/secrets
+            mkdir -p /workspace/base_stack/saml
+            cp /compose-files/nucleus-stack-no-ssl.yml /workspace/base_stack/
+            cp /compose-files/nucleus-stack.env /workspace/base_stack/.env
+            cp /compose-files/federation.meta.blank.xml /workspace/base_stack/saml/
+
+            # Fix PUBLIC_URL in docker-compose to use relative path
+            sed -i 's|PUBLIC_URL: http://.*|PUBLIC_URL: /|g' /workspace/base_stack/nucleus-stack-no-ssl.yml
+            echo "Applied PUBLIC_URL fix to docker-compose file"
+
+            # No need for extra_hosts - LoadBalancer hostname will be set in SERVER_IP_OR_HOST
+            echo "Skipping extra_hosts configuration (using LoadBalancer)"
+
+            echo "Copying secret files..."
+            cp /compose-files/auth_root_of_trust.pem /workspace/base_stack/secrets/
+            cp /compose-files/auth_root_of_trust.pub /workspace/base_stack/secrets/
+            cp /compose-files/auth_root_of_trust_lt.pem /workspace/base_stack/secrets/
+            cp /compose-files/auth_root_of_trust_lt.pub /workspace/base_stack/secrets/
+            cp /compose-files/pwd_salt /workspace/base_stack/secrets/
+            cp /compose-files/lft_salt /workspace/base_stack/secrets/
+            cp /compose-files/svc_reg_token /workspace/base_stack/secrets/
+
+            echo "Verifying secrets directory:"
+            ls -la /workspace/base_stack/secrets/
+
+            cd /workspace/base_stack
+
+            # Override critical configuration
+            echo "" >> .env
+            echo "PUBLIC_URL=/" >> .env
+            echo "MASTER_PASSWORD=$MASTER_PASSWORD" >> .env
+            echo "SERVICE_PASSWORD=$SERVICE_PASSWORD" >> .env
+
+            # Set SERVER_IP_OR_HOST from LoadBalancer hostname (written by init container)
+            if [ -f /shared/loadbalancer-hostname ]; then
+              LB_HOST=$(cat /shared/loadbalancer-hostname)
+              echo "Setting SERVER_IP_OR_HOST to LoadBalancer: $LB_HOST"
+              sed -i "/^SERVER_IP_OR_HOST=/c\SERVER_IP_OR_HOST=$LB_HOST" .env
+              echo "✓ SERVER_IP_OR_HOST configured"
+            else
+              echo "WARNING: LoadBalancer hostname file not found"
+              echo "Services will use default hostname-or-ip-here"
+            fi
+
+            echo "Cleaning up any existing containers..."
+            docker-compose -f nucleus-stack-no-ssl.yml down --remove-orphans 2>/dev/null || true
+
+            echo "Starting NVIDIA Omniverse Nucleus..."
+            docker-compose -f nucleus-stack-no-ssl.yml up -d
+
+            echo "Waiting for Navigator container to be healthy..."
+            for i in $(seq 1 30); do
+              if docker exec base_stack-nucleus-navigator-1 echo "ready" >/dev/null 2>&1; then
+                echo "Navigator is ready!"
+                break
+              fi
+              echo "Waiting... ($i/30)"
+              sleep 2
+            done
+
+            echo "Configuring Navigator NGINX to proxy API requests..."
+            docker exec base_stack-nucleus-navigator-1 sh -c "cat > /etc/nginx/sites-available/default <<'NGINXEOF'
+            map \$http_upgrade \$connection_upgrade {
+                default upgrade;
+                '' close;
+            }
+
+            server {
+                listen 80;
+                server_name _;
+                client_max_body_size 32m;
+                client_body_buffer_size 128k;
+                client_header_buffer_size 5120k;
+                large_client_header_buffers 16 5120k;
+
+                # API proxy rules - MUST come before / location
+                location /omni/discovery/ {
+                    proxy_pass http://nucleus-discovery:3333/;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade \$http_upgrade;
+                    proxy_set_header Connection \$connection_upgrade;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                }
+
+                location /omni/auth/ {
+                    proxy_pass http://nucleus-auth:3100/;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                }
+
+                location /omni/ {
+                    proxy_pass http://nucleus-api:3009/;
+                    proxy_http_version 1.1;
+                    proxy_set_header Host \$host;
+                    proxy_set_header X-Real-IP \$remote_addr;
+                    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                    proxy_read_timeout 86400;
+                }
+
+                # Static files for Navigator UI
+                location / {
+                    add_header 'Cross-Origin-Opener-Policy' 'same-origin';
+                    add_header 'Cross-Origin-Embedder-Policy' 'credentialless';
+                    root /usr/share/nginx/html;
+                    try_files \$uri /index.html;
+                }
+            }
+            NGINXEOF
+            " || echo "Warning: NGINX config failed, will retry later"
+
+            echo "Reloading Navigator NGINX..."
+            docker exec base_stack-nucleus-navigator-1 nginx -s reload || echo "Warning: NGINX reload failed"
+
+            echo "Nucleus started. Tailing logs..."
+            docker-compose -f nucleus-stack-no-ssl.yml logs -f
+        env:
+          - name: DOCKER_HOST
+            value: tcp://localhost:2375
+          - name: NGC_API_KEY
+            value: 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
+          - name: MASTER_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: master-password
+                key: password
+          - name: SERVICE_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: service-password
+                key: password
+        volumeMounts:
+          - name: compose-files
+            mountPath: /compose-files
+          - name: workspace
+            mountPath: /workspace
+          - name: shared-data
+            mountPath: /shared
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+      volumes:
+        - name: docker-storage
+          emptyDir: {}
+        - name: nucleus-data
+          persistentVolumeClaim:
+            claimName: nucleus-dind-data
+        - name: compose-files
+          configMap:
+            name: nucleus-compose-files
+        - name: workspace
+          emptyDir: {}
+        - name: shared-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nucleus-dind
+  namespace: hacohen-omniverse
+  labels:
+    app: nucleus-dind
+spec:
+  type: LoadBalancer
+  selector:
+    app: nucleus-dind
+  ports:
+    - name: navigator
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: discovery
+      port: 3333
+      targetPort: 3333
+      protocol: TCP
+    - name: auth
+      port: 3100
+      targetPort: 3100
+      protocol: TCP
+    - name: auth-ssl
+      port: 3180
+      targetPort: 3180
+      protocol: TCP
+    - name: auth-admin
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+    - name: api
+      port: 3009
+      targetPort: 3009
+      protocol: TCP
+    - name: api-admin
+      port: 3106
+      targetPort: 3106
+      protocol: TCP
+    - name: lft
+      port: 3030
+      targetPort: 3030
+      protocol: TCP
+    - name: search
+      port: 3400
+      targetPort: 3400
+      protocol: TCP
+    - name: tagging
+      port: 3020
+      targetPort: 3020
+      protocol: TCP
