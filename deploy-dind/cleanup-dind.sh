@@ -43,10 +43,12 @@ if [ "$DEPLOYMENT_EXISTS" -eq 0 ]; then
 fi
 
 # Ask for confirmation
-echo -e "${YELLOW}WARNING: This will delete the following resources:${NC}"
+echo -e "${YELLOW}WARNING: This will delete ALL resources:${NC}"
 echo "  - Deployment: nucleus-dind"
 echo "  - Service: nucleus-dind (LoadBalancer)"
 echo "  - ConfigMap: nucleus-compose-files"
+echo "  - ServiceAccount: nucleus-dind-sa"
+echo "  - Secrets: crypto-secrets"
 echo ""
 
 if [ "$PVC_EXISTS" -gt 0 ]; then
@@ -88,7 +90,28 @@ else
 fi
 
 echo ""
-echo "==> Step 5: Checking for remaining resources..."
+echo "==> Step 5: Deleting ServiceAccount..."
+oc delete serviceaccount nucleus-dind-sa -n "$NAMESPACE" --ignore-not-found=true
+oc adm policy remove-scc-from-user privileged -z nucleus-dind-sa -n "$NAMESPACE" 2>/dev/null || true
+echo "✓ ServiceAccount deleted"
+
+echo ""
+echo "==> Step 6: Deleting RoleBinding..."
+oc delete rolebinding nucleus-service-reader-binding -n "$NAMESPACE" --ignore-not-found=true
+echo "✓ RoleBinding deleted"
+
+echo ""
+echo "==> Step 7: Deleting Role..."
+oc delete role nucleus-service-reader -n "$NAMESPACE" --ignore-not-found=true
+echo "✓ Role deleted"
+
+echo ""
+echo "==> Step 8: Deleting Secrets..."
+oc delete secret crypto-secrets -n "$NAMESPACE" --ignore-not-found=true
+echo "✓ Secrets deleted"
+
+echo ""
+echo "==> Step 9: Checking for remaining resources..."
 REMAINING=$(oc get all -n "$NAMESPACE" -l app=nucleus-dind 2>/dev/null | wc -l)
 if [ "$REMAINING" -gt 0 ]; then
     echo -e "${YELLOW}⚠ Some resources still exist:${NC}"
@@ -99,9 +122,9 @@ fi
 
 echo ""
 echo "======================================"
-echo -e "${GREEN}✅ DIND cleanup complete!${NC}"
+echo -e "${GREEN}✅ Complete cleanup finished!${NC}"
 echo "======================================"
 echo ""
-echo "ServiceAccount and secrets remain for redeployment."
+echo "All resources have been deleted."
 echo "To redeploy: ./deploy-dind/deploy-dind.sh"
 echo ""
