@@ -30,10 +30,12 @@ echo "Namespace: $NAMESPACE"
 echo "======================================"
 echo ""
 
-# Check if crypto secrets exist
+# Check if crypto secrets exist, if not generate them
 if ! oc get secret crypto-secrets -n "$NAMESPACE" &>/dev/null; then
-    echo "ERROR: crypto-secrets not found. Run 'make secrets' first."
-    exit 1
+    echo "==> Crypto secrets not found. Generating..."
+    "$SCRIPT_DIR/generate-secrets.sh"
+    echo "✓ Secrets generated"
+    echo ""
 fi
 
 echo "==> Step 1: Creating ServiceAccount and SCC binding..."
@@ -53,11 +55,15 @@ oc get secret crypto-secrets -n "$NAMESPACE" -o json | \
 
 echo ""
 echo "==> Step 3: Finding NGC package files..."
-NGC_FILES=$(find "$PROJECT_ROOT" -maxdepth 1 -name "nucleus-stack-*.tar.gz" 2>/dev/null | sort | tail -1)
+# Look in upstream directory first, then fall back to project root
+NGC_FILES=$(find "$PROJECT_ROOT/upstream" -maxdepth 1 -name "nucleus-stack-*.tar.gz" 2>/dev/null | sort | tail -1)
+if [ -z "$NGC_FILES" ]; then
+    NGC_FILES=$(find "$PROJECT_ROOT" -maxdepth 1 -name "nucleus-stack-*.tar.gz" 2>/dev/null | sort | tail -1)
+fi
 
 if [ -z "$NGC_FILES" ]; then
-    echo "ERROR: NGC package not found in project root directory"
-    echo "Please download nucleus-stack-*.tar.gz from NGC and place it in the project root"
+    echo "ERROR: NGC package not found in upstream/ or project root directory"
+    echo "Please download nucleus-stack-*.tar.gz from NGC and place it in upstream/"
     rm -rf "$TEMP_SECRETS"
     exit 1
 fi
